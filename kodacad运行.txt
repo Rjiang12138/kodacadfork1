@@ -1,0 +1,12 @@
+kodacad
+1.新建正确版本环境（项目要求：pythonOCC 7.5 + Python 3.8）
+conda create -n pyocc python=3.8 -y
+conda activate pyocc
+2.安装项目要求的 pythonOCC 7.5.1
+conda install -c conda-forge pythonocc-core=7.5.1 -y
+3.安装 PyQt5
+pip install pyqt5
+4.进到kodacad文件夹运行
+python .\kodacad.py
+5.加载STP
+File->Load STP at top
