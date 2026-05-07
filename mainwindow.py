@@ -864,7 +864,10 @@ class MainWindow(QMainWindow):
             self.section_preview_ready = True
             return True
         except Exception as err:
-            logger.error("Section preview init failed: %s", err)
+            logger.error(
+                "Section preview init failed; check OpenGL/graphics support. Details: %s",
+                err,
+            )
             return False
 
     def export_section_image(self):
@@ -888,7 +891,10 @@ class MainWindow(QMainWindow):
             self.section_canvas._display.ExportToImage(file_name)
         except Exception as err:
             logger.error("Section image export failed: %s", err)
-            self.statusBar().showMessage(f"Section image export failed: {err}", 5000)
+            self.statusBar().showMessage(
+                "Failed to export section image. Check file path and permissions.",
+                5000,
+            )
             return
         msg = f"Section image exported: {file_name}"
         print(msg)
@@ -896,7 +902,6 @@ class MainWindow(QMainWindow):
 
     def _clear_section_preview(self):
         if not self._ensure_section_preview():
-            self.section_preview_ais_list = []
             return
         context = self.section_canvas._display.Context
         for ais_shape in self.section_preview_ais_list:
