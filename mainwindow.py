@@ -276,6 +276,7 @@ class MainWindow(QMainWindow):
         self.resize(960, 720)
         self.setCentralWidget(self.canvas)
         self.createDockWidget()
+        self.create_section_preview_dock()
         self.wcToolBar = QToolBar("2D")  # Construction toolbar
         self.addToolBar(Qt.RightToolBarArea, self.wcToolBar)
         self.wcToolBar.setMovable(True)
@@ -338,6 +339,8 @@ class MainWindow(QMainWindow):
         self.ancestor_dict = defaultdict(list)
         self.ais_shape_dict = {}  # {uid: <AIS_Shape> object}
         self.section_ais_list = []  # AIS objects of current section overlay
+        self.section_preview_ais_list = []  # AIS objects in section preview panel
+        self.section_preview_ready = False
         self.section_base_ax3 = None  # gp_Ax3 used by static/dynamic section
         self.section_report_text = ""
         self.dynamic_section_dialog = None
@@ -367,6 +370,16 @@ class MainWindow(QMainWindow):
         self.treeView.itemClicked.connect(self.treeViewItemClicked)
         self.treeDockWidget.setWidget(self.treeView)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.treeDockWidget)
+
+    def create_section_preview_dock(self):
+        self.sectionDockWidget = QDockWidget("Section Preview", self)
+        self.sectionDockWidget.setObjectName("sectionDockWidget")
+        self.sectionDockWidget.setAllowedAreas(
+            Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea
+        )
+        self.section_canvas = qtDisplay.qtViewer3d(self.sectionDockWidget)
+        self.sectionDockWidget.setWidget(self.section_canvas)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.sectionDockWidget)
 
     def centerOnScreen(self):
         """Centers the window on the screen."""
@@ -843,6 +856,69 @@ class MainWindow(QMainWindow):
         print(msg)
         self.statusBar().showMessage(msg, 5000)
 
+    def _ensure_section_preview(self):
+        if self.section_preview_ready:
+            return True
+        try:
+            self.section_canvas.InitDriver()
+            self.section_preview_ready = True
+            return True
+        except Exception as err:
+            logger.error("Section preview init failed: %s", err)
+            return False
+
+    def export_section_image(self):
+        """Export section preview viewport to image file."""
+        if not self._ensure_section_preview():
+            self.statusBar().showMessage("Section preview is unavailable.", 5000)
+            return
+        if not self.section_preview_ais_list:
+            self.statusBar().showMessage("No section preview to export.", 5000)
+            return
+        default_name = f"kodacad_section_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        file_name, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Section Image",
+            default_name,
+            "PNG (*.png);;JPEG (*.jpg *.jpeg);;BMP (*.bmp)",
+        )
+        if not file_name:
+            return
+        self.section_canvas._display.ExportToImage(file_name)
+        msg = f"Section image exported: {file_name}"
+        print(msg)
+        self.statusBar().showMessage(msg, 5000)
+
+    def _clear_section_preview(self):
+        if not self._ensure_section_preview():
+            self.section_preview_ais_list = []
+            return
+        context = self.section_canvas._display.Context
+        for ais_shape in self.section_preview_ais_list:
+            context.Remove(ais_shape, False)
+        self.section_preview_ais_list = []
+        self.section_canvas._display.Repaint()
+
+    def _update_section_preview(self, section_shapes, section_plane):
+        if not self._ensure_section_preview():
+            return
+        self._clear_section_preview()
+        if not section_shapes:
+            return
+        context = self.section_canvas._display.Context
+        for shape in section_shapes:
+            ais_sec = AIS_Shape(shape)
+            self.section_preview_ais_list.append(ais_sec)
+            context.Display(ais_sec, False)
+            context.SetColor(ais_sec, Quantity_Color(Quantity_NOC_RED), False)
+        axis = section_plane.Position()
+        normal = axis.Direction()
+        xdir = axis.XDirection()
+        self.section_canvas._display.View.SetProj(normal.X(), normal.Y(), normal.Z())
+        self.section_canvas._display.View.SetUp(xdir.X(), xdir.Y(), xdir.Z())
+        self.section_canvas._display.FitAll()
+        self.section_canvas._display.Repaint()
+
     def _clear_section_overlay(self, show_status=False):
         context = self.canvas._display.Context
         for ais_shape in self.section_ais_list:
@@ -855,6 +931,7 @@ class MainWindow(QMainWindow):
     def clear_section_view(self):
         """Clear displayed section overlay."""
         self._clear_section_overlay(show_status=True)
+        self._clear_section_preview()
         self.section_report_text = ""
 
     def _default_section_ax3(self):
@@ -898,6 +975,7 @@ class MainWindow(QMainWindow):
         total_area = 0.0
         failed_edge_lengths = 0
         part_reports = []
+        section_shapes = []
         bbox = Bnd_Box()
 
         context = self.canvas._display.Context
@@ -914,6 +992,7 @@ class MainWindow(QMainWindow):
             sec_shape = sec_algo.Shape()
             if sec_shape.IsNull():
                 continue
+            section_shapes.append(sec_shape)
 
             ais_sec = AIS_Shape(sec_shape)
             self.section_ais_list.append(ais_sec)
@@ -956,6 +1035,7 @@ class MainWindow(QMainWindow):
             )
 
         self.canvas._display.Repaint()
+        self._update_section_preview(section_shapes, section_plane)
 
         if not self.section_ais_list:
             return (
@@ -1015,6 +1095,7 @@ class MainWindow(QMainWindow):
         """Called when dynamic section dialog is closed by user."""
         self.dynamic_section_dialog = None
         self._clear_section_overlay(show_status=False)
+        self._clear_section_preview()
         self.section_base_ax3 = None
         self.statusBar().showMessage("Dynamic section stopped.", 5000)
 
@@ -1025,6 +1106,7 @@ class MainWindow(QMainWindow):
             self.dynamic_section_dialog = None
             dlg.close()
         self._clear_section_overlay(show_status=False)
+        self._clear_section_preview()
         self.section_base_ax3 = None
         self.statusBar().showMessage("Dynamic section stopped.", 5000)
 
