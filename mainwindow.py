@@ -22,39 +22,55 @@
 #
 
 from collections import defaultdict
+from datetime import datetime
 import logging
 from PyQt5.QtCore import Qt, QPersistentModelIndex, QModelIndex
 from PyQt5.QtGui import QBrush, QColor
 from PyQt5.QtWidgets import (
+    QDialog,
+    QDoubleSpinBox,
     QLabel,
     QLineEdit,
     QMainWindow,
-    QTreeWidget,
-    QMenu,
+    QFileDialog,
+    QVBoxLayout,
+    QHBoxLayout,
+    QSlider,
+    QPushButton,
+    QPlainTextEdit,
     QDockWidget,
     QDesktopWidget,
-    QToolButton,
-    QTreeWidgetItem,
+    QMenu,
     QAction,
-    QFrame,
-    QToolBar,
     QAbstractItemView,
+    QFrame,
     QInputDialog,
+    QToolBar,
+    QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QTreeWidgetItemIterator,
 )
 from OCC.Core.AIS import AIS_Shape, AIS_Line, AIS_Circle
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.BRepAdaptor import BRepAdaptor_Curve
+from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Section
+from OCC.Core.BRepBndLib import brepbndlib_Add
+from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+from OCC.Core.BRepGProp import brepgprop_LinearProperties, brepgprop_SurfaceProperties
+from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.CPnts import CPnts_AbscissaPoint_Length
-from OCC.Core.gp import gp_Vec
+from OCC.Core.GProp import GProp_GProps
+from OCC.Core.gp import gp_Ax3, gp_Dir, gp_Pln, gp_Pnt, gp_Vec
 from OCC.Core.Prs3d import Prs3d_LineAspect
 from OCC.Core.Quantity import (
     Quantity_Color,
     Quantity_NOC_GRAY,
     Quantity_NOC_DARKGREEN,
     Quantity_NOC_MAGENTA1,
+    Quantity_NOC_RED,
 )
-from OCC.Core.TopoDS import topods_Edge, topods_Vertex
+from OCC.Core.TopoDS import topods_Edge, topods_Vertex, topods_Wire
 import OCC.Display.OCCViewer
 import OCC.Display.backend
 
@@ -66,6 +82,7 @@ from OCC import VERSION
 from OCC.Display import qtDisplay  # For pythonocc-7.5
 import rpnCalculator
 from docmodel import DocModel
+from OCCUtils import Topology
 from version import APP_VERSION
 
 print("OCC version: %s" % VERSION)
@@ -74,6 +91,77 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.ERROR)  # set to DEBUG | INFO | ERROR
 
 dm = DocModel()
+
+
+class DynamicSectionDialog(QDialog):
+    """Dialog for realtime section offset control."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Dynamic Section")
+        self.resize(520, 360)
+        self._updating = False
+
+        root = QVBoxLayout(self)
+        row = QHBoxLayout()
+
+        self.offset_slider = QSlider(Qt.Horizontal)
+        self.offset_slider.setRange(-1000, 1000)
+        self.offset_slider.setValue(0)
+        self.offset_slider.setSingleStep(1)
+        self.offset_slider.setPageStep(10)
+
+        self.offset_spin = QDoubleSpinBox()
+        self.offset_spin.setRange(-100.0, 100.0)
+        self.offset_spin.setDecimals(1)
+        self.offset_spin.setSingleStep(0.5)
+        self.offset_spin.setValue(0.0)
+        self.offset_spin.setSuffix(" mm")
+
+        row.addWidget(self.offset_slider)
+        row.addWidget(self.offset_spin)
+        root.addLayout(row)
+
+        self.report_view = QPlainTextEdit()
+        self.report_view.setReadOnly(True)
+        root.addWidget(self.report_view)
+
+        self.close_btn = QPushButton("Stop")
+        root.addWidget(self.close_btn)
+
+        self.offset_slider.valueChanged.connect(self._slider_changed)
+        self.offset_spin.valueChanged.connect(self._spin_changed)
+        self.close_btn.clicked.connect(self.close)
+
+    def _slider_changed(self, value):
+        if self._updating:
+            return
+        self._updating = True
+        mm_value = value / 10.0
+        self.offset_spin.setValue(mm_value)
+        self._updating = False
+        parent = self.parent()
+        if parent:
+            parent.update_dynamic_section_offset(mm_value)
+
+    def _spin_changed(self, value):
+        if self._updating:
+            return
+        self._updating = True
+        self.offset_slider.setValue(int(round(value * 10.0)))
+        self._updating = False
+        parent = self.parent()
+        if parent:
+            parent.update_dynamic_section_offset(value)
+
+    def set_report(self, text):
+        self.report_view.setPlainText(text)
+
+    def closeEvent(self, event):
+        parent = self.parent()
+        if parent:
+            parent.on_dynamic_section_dialog_closed()
+        super().closeEvent(event)
 
 
 class TreeView(QTreeWidget):
@@ -243,6 +331,10 @@ class MainWindow(QMainWindow):
         # {uid: [list of ancestor shapes]}
         self.ancestor_dict = defaultdict(list)
         self.ais_shape_dict = {}  # {uid: <AIS_Shape> object}
+        self.section_ais_list = []  # AIS objects of current section overlay
+        self.section_base_ax3 = None  # gp_Ax3 used by static/dynamic section
+        self.section_report_text = ""
+        self.dynamic_section_dialog = None
 
         self.activeWp = None  # WorkPlane object
         self.activeWpUID = 0
@@ -722,6 +814,206 @@ class MainWindow(QMainWindow):
             self.currOpLabel.setText("Current Operation: None ")
             self.statusBar().showMessage("")
             self.canvas._display.SetSelectionModeNeutral()
+
+    #############################################
+    #
+    # Section and export methods
+    #
+    #############################################
+
+    def export_view_image(self):
+        """Export current 3D viewport to image file."""
+        default_name = f"kodacad_view_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        file_name, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export View Image",
+            default_name,
+            "PNG (*.png);;JPEG (*.jpg *.jpeg);;BMP (*.bmp)",
+        )
+        if not file_name:
+            return
+        self.canvas._display.ExportToImage(file_name)
+        msg = f"View image exported: {file_name}"
+        print(msg)
+        self.statusBar().showMessage(msg, 5000)
+
+    def _clear_section_overlay(self, show_status=False):
+        context = self.canvas._display.Context
+        for ais_shape in self.section_ais_list:
+            context.Remove(ais_shape, False)
+        self.section_ais_list = []
+        self.canvas._display.Repaint()
+        if show_status:
+            self.statusBar().showMessage("Section view cleared.", 5000)
+
+    def clear_section_view(self):
+        """Clear displayed section overlay."""
+        self._clear_section_overlay(show_status=True)
+        self.section_report_text = ""
+
+    def _default_section_ax3(self):
+        if self.activeWp and getattr(self.activeWp, "gpPlane", None):
+            return gp_Ax3(self.activeWp.gpPlane.Position())
+        return gp_Ax3(gp_Pnt(0.0, 0.0, 0.0), gp_Dir(0.0, 0.0, 1.0), gp_Dir(1.0, 0.0, 0.0))
+
+    def _build_offset_plane(self, offset_mm):
+        ax3 = self.section_base_ax3 if self.section_base_ax3 else self._default_section_ax3()
+        origin = ax3.Location()
+        normal = ax3.Direction()
+        shifted_origin = gp_Pnt(
+            origin.X() + normal.X() * offset_mm,
+            origin.Y() + normal.Y() * offset_mm,
+            origin.Z() + normal.Z() * offset_mm,
+        )
+        return gp_Pln(gp_Ax3(shifted_origin, normal, ax3.XDirection()))
+
+    def _format_bbox(self, bbox):
+        if bbox.IsVoid():
+            return "N/A"
+        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+        dx = xmax - xmin
+        dy = ymax - ymin
+        dz = zmax - zmin
+        return (
+            f"X[{xmin:.4f}, {xmax:.4f}] Δ={dx:.4f}; "
+            f"Y[{ymin:.4f}, {ymax:.4f}] Δ={dy:.4f}; "
+            f"Z[{zmin:.4f}, {zmax:.4f}] Δ={dz:.4f}"
+        )
+
+    def _section_report_for_plane(self, section_plane, offset_mm):
+        total_edges = 0
+        total_vertices = 0
+        total_wires = 0
+        total_length = 0.0
+        total_area = 0.0
+        part_reports = []
+        bbox = Bnd_Box()
+
+        context = self.canvas._display.Context
+        self._clear_section_overlay(show_status=False)
+
+        for uid, part_data in dm.part_dict.items():
+            if uid in self.hide_list:
+                continue
+            shape = part_data["shape"]
+            sec_algo = BRepAlgoAPI_Section(shape, section_plane, False)
+            sec_algo.Build()
+            if not sec_algo.IsDone():
+                continue
+            sec_shape = sec_algo.Shape()
+            if sec_shape.IsNull():
+                continue
+
+            ais_sec = AIS_Shape(sec_shape)
+            self.section_ais_list.append(ais_sec)
+            context.Display(ais_sec, False)
+            context.SetColor(ais_sec, Quantity_Color(Quantity_NOC_RED), False)
+
+            brepbndlib_Add(sec_shape, bbox)
+            topo = Topology.Topo(sec_shape)
+            edges = list(topo.edges())
+            wires = list(topo.wires())
+            vertices = list(topo.vertices())
+
+            edge_length = 0.0
+            for edge in edges:
+                try:
+                    edge_length += CPnts_AbscissaPoint_Length(BRepAdaptor_Curve(edge))
+                except RuntimeError:
+                    continue
+
+            area_sum = 0.0
+            for wire in wires:
+                wire_props = GProp_GProps()
+                brepgprop_LinearProperties(wire, wire_props)
+                if wire_props.Mass() <= 0.0:
+                    continue
+                mk_face = BRepBuilderAPI_MakeFace(topods_Wire(wire))
+                if mk_face.IsDone():
+                    face_props = GProp_GProps()
+                    brepgprop_SurfaceProperties(mk_face.Face(), face_props)
+                    area_sum += face_props.Mass()
+
+            total_edges += len(edges)
+            total_wires += len(wires)
+            total_vertices += len(vertices)
+            total_length += edge_length
+            total_area += area_sum
+            part_reports.append(
+                f"  - UID {uid}: edges={len(edges)}, wires={len(wires)}, "
+                f"vertices={len(vertices)}, length={edge_length:.4f} mm, area={area_sum:.4f} mm²"
+            )
+
+        self.canvas._display.Repaint()
+
+        if not self.section_ais_list:
+            return (
+                f"Section Offset={offset_mm:.3f} mm | plane has no intersection with visible parts.\n"
+                "Tip: adjust dynamic section offset or switch active workplane."
+            )
+
+        plane_axis = section_plane.Position()
+        loc = plane_axis.Location()
+        nrm = plane_axis.Direction()
+        summary = [
+            "Section Annotation Report",
+            f"- Plane origin: ({loc.X():.4f}, {loc.Y():.4f}, {loc.Z():.4f}) mm",
+            f"- Plane normal: ({nrm.X():.6f}, {nrm.Y():.6f}, {nrm.Z():.6f})",
+            f"- Plane offset along normal: {offset_mm:.3f} mm",
+            f"- Intersections: parts={len(part_reports)}, wires={total_wires}, edges={total_edges}, vertices={total_vertices}",
+            f"- Total section curve length: {total_length:.4f} mm",
+            f"- Estimated closed-profile area sum: {total_area:.4f} mm²",
+            f"- Section bounding box: {self._format_bbox(bbox)}",
+            "- Per part:",
+        ]
+        summary.extend(part_reports)
+        return "\n".join(summary)
+
+    def create_section_view(self, offset_mm=0.0, keep_base=False):
+        """Create section overlay and print detailed annotation report."""
+        if not keep_base or self.section_base_ax3 is None:
+            self.section_base_ax3 = self._default_section_ax3()
+        section_plane = self._build_offset_plane(offset_mm)
+        self.section_report_text = self._section_report_for_plane(section_plane, offset_mm)
+        print(self.section_report_text)
+        first_line = self.section_report_text.splitlines()[0]
+        self.statusBar().showMessage(first_line, 5000)
+        if self.dynamic_section_dialog:
+            self.dynamic_section_dialog.set_report(self.section_report_text)
+
+    def start_dynamic_section(self):
+        """Start dynamic section dialog with realtime offset control."""
+        if self.dynamic_section_dialog:
+            self.dynamic_section_dialog.raise_()
+            self.dynamic_section_dialog.activateWindow()
+            return
+        self.section_base_ax3 = self._default_section_ax3()
+        self.create_section_view(offset_mm=0.0, keep_base=True)
+        self.dynamic_section_dialog = DynamicSectionDialog(self)
+        self.dynamic_section_dialog.set_report(self.section_report_text)
+        self.dynamic_section_dialog.show()
+        self.statusBar().showMessage("Dynamic section started.", 5000)
+
+    def update_dynamic_section_offset(self, offset_mm):
+        """Update dynamic section to new offset."""
+        self.create_section_view(offset_mm=offset_mm, keep_base=True)
+
+    def on_dynamic_section_dialog_closed(self):
+        """Called when dynamic section dialog is closed by user."""
+        self.dynamic_section_dialog = None
+        self._clear_section_overlay(show_status=False)
+        self.section_base_ax3 = None
+        self.statusBar().showMessage("Dynamic section stopped.", 5000)
+
+    def stop_dynamic_section(self):
+        """Stop dynamic section dialog and clear section overlay."""
+        if self.dynamic_section_dialog:
+            dlg = self.dynamic_section_dialog
+            self.dynamic_section_dialog = None
+            dlg.close()
+        self._clear_section_overlay(show_status=False)
+        self.section_base_ax3 = None
+        self.statusBar().showMessage("Dynamic section stopped.", 5000)
 
     #############################################
     #
