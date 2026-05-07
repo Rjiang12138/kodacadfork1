@@ -884,7 +884,12 @@ class MainWindow(QMainWindow):
         )
         if not file_name:
             return
-        self.section_canvas._display.ExportToImage(file_name)
+        try:
+            self.section_canvas._display.ExportToImage(file_name)
+        except Exception as err:
+            logger.error("Section image export failed: %s", err)
+            self.statusBar().showMessage(f"Section image export failed: {err}", 5000)
+            return
         msg = f"Section image exported: {file_name}"
         print(msg)
         self.statusBar().showMessage(msg, 5000)
