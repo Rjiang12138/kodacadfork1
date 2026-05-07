@@ -57,7 +57,7 @@ from OCC.Core.BRepAdaptor import BRepAdaptor_Curve
 from OCC.Core.BRepAlgoAPI import BRepAlgoAPI_Section
 from OCC.Core.BRepBndLib import brepbndlib_Add
 from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeFace
-from OCC.Core.BRepGProp import brepgprop_LinearProperties, brepgprop_SurfaceProperties
+from OCC.Core.BRepGProp import brepgprop_SurfaceProperties
 from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.CPnts import CPnts_AbscissaPoint_Length
 from OCC.Core.GProp import GProp_GProps
@@ -70,6 +70,7 @@ from OCC.Core.Quantity import (
     Quantity_NOC_MAGENTA1,
     Quantity_NOC_RED,
 )
+from OCC.Core.TopAbs import TopAbs_WIRE
 from OCC.Core.TopoDS import topods_Edge, topods_Vertex, topods_Wire
 import OCC.Display.OCCViewer
 import OCC.Display.backend
@@ -90,6 +91,10 @@ print("OCC version: %s" % VERSION)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.ERROR)  # set to DEBUG | INFO | ERROR
 
+DEFAULT_SECTION_ORIGIN = (0.0, 0.0, 0.0)
+DEFAULT_SECTION_NORMAL = (0.0, 0.0, 1.0)
+DEFAULT_SECTION_XDIR = (1.0, 0.0, 0.0)
+
 dm = DocModel()
 
 
@@ -106,6 +111,7 @@ class DynamicSectionDialog(QDialog):
         row = QHBoxLayout()
 
         self.offset_slider = QSlider(Qt.Horizontal)
+        # Slider value is offset in 0.1 mm units (range -100.0 mm to 100.0 mm).
         self.offset_slider.setRange(-1000, 1000)
         self.offset_slider.setValue(0)
         self.offset_slider.setSingleStep(1)
@@ -854,7 +860,11 @@ class MainWindow(QMainWindow):
     def _default_section_ax3(self):
         if self.activeWp and getattr(self.activeWp, "gpPlane", None):
             return gp_Ax3(self.activeWp.gpPlane.Position())
-        return gp_Ax3(gp_Pnt(0.0, 0.0, 0.0), gp_Dir(0.0, 0.0, 1.0), gp_Dir(1.0, 0.0, 0.0))
+        return gp_Ax3(
+            gp_Pnt(*DEFAULT_SECTION_ORIGIN),
+            gp_Dir(*DEFAULT_SECTION_NORMAL),
+            gp_Dir(*DEFAULT_SECTION_XDIR),
+        )
 
     def _build_offset_plane(self, offset_mm):
         ax3 = self.section_base_ax3 if self.section_base_ax3 else self._default_section_ax3()
@@ -886,6 +896,7 @@ class MainWindow(QMainWindow):
         total_wires = 0
         total_length = 0.0
         total_area = 0.0
+        failed_edge_lengths = 0
         part_reports = []
         bbox = Bnd_Box()
 
@@ -919,14 +930,14 @@ class MainWindow(QMainWindow):
             for edge in edges:
                 try:
                     edge_length += CPnts_AbscissaPoint_Length(BRepAdaptor_Curve(edge))
-                except RuntimeError:
+                except RuntimeError as err:
+                    failed_edge_lengths += 1
+                    logger.warning("Section edge length calc failed for part %s: %s", uid, err)
                     continue
 
             area_sum = 0.0
             for wire in wires:
-                wire_props = GProp_GProps()
-                brepgprop_LinearProperties(wire, wire_props)
-                if wire_props.Mass() <= 0.0:
+                if wire.ShapeType() != TopAbs_WIRE:
                     continue
                 mk_face = BRepBuilderAPI_MakeFace(topods_Wire(wire))
                 if mk_face.IsDone():
@@ -948,7 +959,7 @@ class MainWindow(QMainWindow):
 
         if not self.section_ais_list:
             return (
-                f"Section Offset={offset_mm:.3f} mm | plane has no intersection with visible parts.\n"
+                f"Section Offset={offset_mm:.3f} mm. Plane has no intersection with visible parts.\n"
                 "Tip: adjust dynamic section offset or switch active workplane."
             )
 
@@ -962,7 +973,9 @@ class MainWindow(QMainWindow):
             f"- Plane offset along normal: {offset_mm:.3f} mm",
             f"- Intersections: parts={len(part_reports)}, wires={total_wires}, edges={total_edges}, vertices={total_vertices}",
             f"- Total section curve length: {total_length:.4f} mm",
-            f"- Estimated closed-profile area sum: {total_area:.4f} mm²",
+            f"- Edge length calc failures: {failed_edge_lengths}",
+            "- Note: total_edges counts all extracted edges; total length excludes failed edge-length calculations.",
+            f"- Closed-wire face area sum: {total_area:.4f} mm² (open wires contribute 0 area)",
             f"- Section bounding box: {self._format_bbox(bbox)}",
             "- Per part:",
         ]
