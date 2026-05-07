@@ -164,6 +164,8 @@ def display_new_active_wp(prev_uid, new_uid):
         win.redraw_workplanes()
     else:
         win.draw_wp(new_uid)
+    if dm.part_dict:
+        win.create_section_view()
 
 
 #############################################
@@ -699,6 +701,7 @@ if __name__ == "__main__":
     win.add_function_to_menu("Workplane", "By 3 points", wpBy3Pts)
     win.add_menu("Section")
     win.add_function_to_menu("Section", "Create Section (Active WP)", win.create_section_view)
+    win.add_function_to_menu("Section", "Export Section Image", win.export_section_image)
     win.add_function_to_menu("Section", "Clear Section", win.clear_section_view)
     win.add_function_to_menu("Section", "Start Dynamic Section", win.start_dynamic_section)
     win.add_function_to_menu("Section", "Stop Dynamic Section", win.stop_dynamic_section)
